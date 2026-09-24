@@ -1,39 +1,84 @@
 import React, { useState, useEffect } from 'react';
-import { Terminal } from 'lucide-react';
+import { Terminal, LogOut } from 'lucide-react';
 import { Timer } from './components/Timer';
 import { ProgressTracker } from './components/ProgressTracker';
 import { SkillTree } from './components/SkillTree';
 import { ResourceHub } from './components/ResourceHub';
-import { INITIAL_CURRICULUM } from './data';
+import { INITIAL_CURRICULUM, Phase } from './data';
+import { supabase } from './lib/supabaseClient';
+import { Login } from './components/Login';
+import { Session } from '@supabase/supabase-js';
 
 function App() {
-  const [phases, setPhases] = useState(INITIAL_CURRICULUM);
+  const [session, setSession] = useState<Session | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const [phases, setPhases] = useState<Phase[]>(INITIAL_CURRICULUM);
   const [currentWeekId, setCurrentWeekId] = useState(1);
   const [totalXp, setTotalXp] = useState(0);
+  const [isDataLoaded, setIsDataLoaded] = useState(false);
 
-  // Load from local storage if exists
   useEffect(() => {
-    const saved = localStorage.getItem('fresher-dashboard-v6');
-    if (saved) {
-      try {
-        const { phases: savedPhases, totalXp: savedXp } = JSON.parse(saved);
-        if (savedPhases && savedPhases[0]?.weeks[0]?.days) {
-          setPhases(savedPhases);
-        } else {
-          localStorage.removeItem('fresher-dashboard-v6');
-          setPhases(INITIAL_CURRICULUM);
-        }
-        if (savedXp !== undefined) setTotalXp(savedXp);
-      } catch (e) {
-        console.error('Failed to load state', e);
-      }
-    }
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setLoading(false);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  // Save to local storage on change
+  // Fetch from Supabase on login
   useEffect(() => {
-    localStorage.setItem('fresher-dashboard-v6', JSON.stringify({ phases, totalXp }));
-  }, [phases, totalXp]);
+    if (!session?.user) return;
+    
+    const fetchProgress = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('user_progress')
+          .select('phases, total_xp')
+          .eq('user_id', session.user.id)
+          .maybeSingle();
+        
+        if (error) throw error;
+
+        if (data) {
+          setPhases(data.phases);
+          setTotalXp(data.total_xp);
+        } else {
+          // Initialize for new user
+          await supabase.from('user_progress').insert([
+            { user_id: session.user.id, phases: INITIAL_CURRICULUM, total_xp: 0 }
+          ]);
+        }
+      } catch (err) {
+        console.error("Error fetching progress from Supabase", err);
+      } finally {
+        setIsDataLoaded(true);
+      }
+    };
+    
+    fetchProgress();
+  }, [session]);
+
+  // Sync to Supabase on change
+  useEffect(() => {
+    if (!session?.user || !isDataLoaded) return;
+    
+    const timeoutId = setTimeout(async () => {
+      await supabase
+        .from('user_progress')
+        .update({ phases, total_xp: totalXp })
+        .eq('user_id', session.user.id);
+    }, 1000); // 1s debounce
+    
+    return () => clearTimeout(timeoutId);
+  }, [phases, totalXp, session, isDataLoaded]);
 
   const toggleDay = (dayId: string) => {
     let newlyCompleted = false;
@@ -59,12 +104,25 @@ function App() {
 
     setPhases(newPhases);
 
-    // Update XP (20 per day completed)
     if (newlyCompleted) setTotalXp(prev => prev + 20);
     if (newlyUncompleted) setTotalXp(prev => Math.max(0, prev - 20));
   };
 
-  // Find current week object
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setIsDataLoaded(false);
+    setPhases(INITIAL_CURRICULUM);
+    setTotalXp(0);
+  };
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center text-neon-green font-mono">Initializing protocol...</div>;
+  }
+
+  if (!session) {
+    return <Login />;
+  }
+
   let currentWeek = phases[0].weeks[0];
   for (const phase of phases) {
     const found = phase.weeks.find(w => w.id === currentWeekId);
@@ -74,10 +132,8 @@ function App() {
     }
   }
 
-  // Leveling logic
-  const XP_PER_LEVEL = 50; // Slightly faster leveling
+  const XP_PER_LEVEL = 50; 
   const level = Math.floor(totalXp / XP_PER_LEVEL) + 1;
-  const nextLevelXp = level * XP_PER_LEVEL;
   
   const getLevelTitle = (lvl: number) => {
     const titles = [
@@ -97,44 +153,50 @@ function App() {
             <span className="text-blue-400">~/</span><span className="text-neon-green">fresher_to_swe</span>.sh
           </h1>
         </div>
+        <button 
+          onClick={handleLogout}
+          className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors"
+        >
+          <LogOut size={16} />
+          Sign Out
+        </button>
       </header>
 
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-8 relative">
-        
-        {/* Left Column: Skill Tree */}
-        <div className="lg:col-span-3">
-          <div className="sticky top-8">
-            <SkillTree 
-              phases={phases} 
-              currentWeekId={currentWeekId} 
-              setCurrentWeekId={setCurrentWeekId} 
-            />
-          </div>
-        </div>
-
-        {/* Center Column: Daily Roadmap */}
-        <div className="lg:col-span-6 flex flex-col gap-8">
-          <ProgressTracker 
-            currentWeek={currentWeek}
-            toggleDay={toggleDay}
-            level={level}
-            levelTitle={getLevelTitle(level)}
-            xpInCurrentLevel={totalXp % XP_PER_LEVEL}
-            xpRequiredForNextLevel={XP_PER_LEVEL}
-          />
-        </div>
-
-        {/* Right Column: Timer & Resource Hub */}
-        <div className="lg:col-span-3 flex flex-col gap-8">
-          <div className="sticky top-8 flex flex-col gap-8 h-[calc(100vh-100px)]">
-            <Timer />
-            <div className="flex-1 min-h-0">
-              <ResourceHub />
+      {!isDataLoaded ? (
+        <div className="flex-1 flex items-center justify-center text-neon-green font-mono">Loading user profile...</div>
+      ) : (
+        <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-8 relative">
+          <div className="lg:col-span-3">
+            <div className="sticky top-8">
+              <SkillTree 
+                phases={phases} 
+                currentWeekId={currentWeekId} 
+                setCurrentWeekId={setCurrentWeekId} 
+              />
             </div>
           </div>
-        </div>
 
-      </main>
+          <div className="lg:col-span-6 flex flex-col gap-8">
+            <ProgressTracker 
+              currentWeek={currentWeek}
+              toggleDay={toggleDay}
+              level={level}
+              levelTitle={getLevelTitle(level)}
+              xpInCurrentLevel={totalXp % XP_PER_LEVEL}
+              xpRequiredForNextLevel={XP_PER_LEVEL}
+            />
+          </div>
+
+          <div className="lg:col-span-3 flex flex-col gap-8">
+            <div className="sticky top-8 flex flex-col gap-8 h-[calc(100vh-100px)]">
+              <Timer />
+              <div className="flex-1 min-h-0">
+                <ResourceHub />
+              </div>
+            </div>
+          </div>
+        </main>
+      )}
     </div>
   );
 }
